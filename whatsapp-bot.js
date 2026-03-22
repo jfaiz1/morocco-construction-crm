@@ -185,9 +185,10 @@ class WhatsAppBot {
    */
   async parseInvoiceWithClaude(base64Image) {
     try {
-      const response = await axios.post(CLAUDE_API_URL, {
+      // Step 1: First, have Claude describe what it sees
+      const descResponse = await axios.post(CLAUDE_API_URL, {
         model: 'claude-opus-4-1',
-        max_tokens: 1024,
+        max_tokens: 500,
         messages: [
           {
             role: 'user',
@@ -202,22 +203,13 @@ class WhatsAppBot {
               },
               {
                 type: 'text',
-                text: `Carefully analyze this invoice/receipt/bill image and extract the following information. Ignore watermarks, signatures, and overlays - focus on the printed text.
+                text: `Read this invoice/receipt image and tell me:
+1. What company/vendor name do you see?
+2. What is the total amount (look for "Total", "Montant", "Total TTC", "Total NET")?
+3. What date do you see (look for "Date", "Échéance")?
+4. What is being invoiced for (brief description)?
 
-Extract in JSON format:
-{
-  "vendor": "Company/Client name (look for prominent business name)",
-  "amount": "Total amount as number (look for 'Total', 'Montant', 'Total TTC', 'Total NET')",
-  "dueDate": "Due date in YYYY-MM-DD format (look for 'Date', 'Due', 'Échéance')",
-  "description": "Brief description of items/services (first line of description)"
-}
-
-Rules:
-- Extract the MAIN total amount (not subtotals)
-- If date format is DD/MM/YYYY, convert to YYYY-MM-DD
-- If any field is unclear or missing, use null
-- Return ONLY valid JSON, no other text
-- Ignore signatures, stamps, watermarks - only read printed text`
+Answer in simple text, one item per line.`
               }
             ]
           }
@@ -229,12 +221,48 @@ Rules:
         }
       });
 
-      const textContent = response.data.content.find(c => c.type === 'text');
-      if (!textContent) return { success: false };
+      const descContent = descResponse.data.content.find(c => c.type === 'text');
+      if (!descContent) return { success: false };
+
+      console.log('📄 Invoice description:', descContent.text);
+
+      // Step 2: Now extract structured JSON from the description
+      const extractResponse = await axios.post(CLAUDE_API_URL, {
+        model: 'claude-opus-4-1',
+        max_tokens: 300,
+        messages: [
+          {
+            role: 'user',
+            content: `Based on this invoice information:
+${descContent.text}
+
+Extract and return ONLY this JSON (no other text):
+{
+  "vendor": "company name",
+  "amount": "total number only",
+  "dueDate": "YYYY-MM-DD format",
+  "description": "brief description"
+}
+
+Rules: Use null for any missing fields. If date is DD/MM/YYYY format, convert to YYYY-MM-DD.`
+          }
+        ]
+      }, {
+        headers: {
+          'x-api-key': CLAUDE_API_KEY,
+          'anthropic-version': '2023-06-01'
+        }
+      });
+
+      const extractContent = extractResponse.data.content.find(c => c.type === 'text');
+      if (!extractContent) return { success: false };
 
       // Extract JSON from response
-      const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) return { success: false };
+      const jsonMatch = extractContent.text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) {
+        console.error('Could not find JSON in extraction response:', extractContent.text);
+        return { success: false };
+      }
 
       const parsed = JSON.parse(jsonMatch[0]);
       return { success: true, ...parsed };
