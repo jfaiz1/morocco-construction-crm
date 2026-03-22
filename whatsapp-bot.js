@@ -202,15 +202,22 @@ class WhatsAppBot {
               },
               {
                 type: 'text',
-                text: `Analyze this invoice image and extract the following information in JSON format:
+                text: `Carefully analyze this invoice/receipt/bill image and extract the following information. Ignore watermarks, signatures, and overlays - focus on the printed text.
+
+Extract in JSON format:
 {
-  "vendor": "Client/Company name",
-  "amount": "Total amount (numeric only)",
-  "dueDate": "Due date (YYYY-MM-DD format)",
-  "description": "Brief description of work/items"
+  "vendor": "Company/Client name (look for prominent business name)",
+  "amount": "Total amount as number (look for 'Total', 'Montant', 'Total TTC', 'Total NET')",
+  "dueDate": "Due date in YYYY-MM-DD format (look for 'Date', 'Due', 'Échéance')",
+  "description": "Brief description of items/services (first line of description)"
 }
 
-If any field is missing, use null. Be strict JSON format.`
+Rules:
+- Extract the MAIN total amount (not subtotals)
+- If date format is DD/MM/YYYY, convert to YYYY-MM-DD
+- If any field is unclear or missing, use null
+- Return ONLY valid JSON, no other text
+- Ignore signatures, stamps, watermarks - only read printed text`
               }
             ]
           }
