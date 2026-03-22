@@ -186,7 +186,7 @@ class WhatsAppBot {
   async parseInvoiceWithClaude(base64Image) {
     try {
       const response = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-3-5-sonnet-20241022',
+        model: 'claude-opus-4-1',
         max_tokens: 1024,
         messages: [
           {
@@ -268,7 +268,7 @@ If any field is missing, use null. Be strict JSON format.`
   async detectIntent(text, language) {
     try {
       const response = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-3-5-sonnet-20241022',
+        model: 'claude-opus-4-1',
         max_tokens: 256,
         messages: [
           {
@@ -423,7 +423,7 @@ Répondez avec votre choix!`;
   async askClaude(fromNumber, question) {
     try {
       const response = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-3-5-sonnet-20241022',
+        model: 'claude-opus-4-1',
         max_tokens: 512,
         messages: [
           {
