@@ -554,13 +554,25 @@ Respond helpfully in the same language. Keep it short and WhatsApp-friendly.`
    * Download media from URL
    */
   async downloadMedia(mediaUrl) {
-    return new Promise((resolve, reject) => {
-      https.get(mediaUrl, (response) => {
-        const chunks = [];
-        response.on('data', chunk => chunks.push(chunk));
-        response.on('end', () => resolve(Buffer.concat(chunks)));
-      }).on('error', reject);
-    });
+    try {
+      // Use axios with Twilio Basic Auth
+      const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
+      const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
+
+      const auth = Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64');
+
+      const response = await axios.get(mediaUrl, {
+        headers: {
+          'Authorization': `Basic ${auth}`
+        },
+        responseType: 'arraybuffer'
+      });
+
+      return Buffer.from(response.data);
+    } catch (error) {
+      console.error('Error downloading media from Twilio:', error.message);
+      throw error;
+    }
   }
 
   /**
