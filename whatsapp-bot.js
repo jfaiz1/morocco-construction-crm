@@ -104,9 +104,9 @@ class WhatsAppBot {
 📋 Client: *${vendor}*
 💰 Montant: *${amount} MAD*
 📅 Échéance: *${this.formatDate(dueDate)}*
-🆔 ID: \`${invoice.id}\`
+🆔 ID: \`${created.id}\`
 
-👉 Répondez "Paiement ${invoice.id}" pour demander le paiement`;
+👉 Répondez "Paiement ${created.id}" pour demander le paiement`;
 
       return confirmMsg;
     } catch (error) {
