@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const dotenv = require('dotenv');
 const twilio = require('twilio');
+const { PrismaClient } = require('@prisma/client');
 const WhatsAppBot = require('./whatsapp-bot');
-const { initializeFirestore, FirestoreDB } = require('./firestore-db');
 
 dotenv.config();
 
@@ -15,19 +15,11 @@ const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || 'your-account-sid';
 const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || 'your-auth-token';
 const TWILIO_PHONE_NUMBER = process.env.TWILIO_PHONE_NUMBER || 'whatsapp:+1234567890';
 
-// Initialize Firestore
-let db;
-try {
-  initializeFirestore();
-  db = new FirestoreDB();
-  console.log('💾 Using Firestore database');
-} catch (error) {
-  console.error('❌ Firestore initialization failed:', error.message);
-  console.log('⚠️  Please set up Firebase credentials');
-  process.exit(1);
-}
+// Initialize Prisma
+const prisma = new PrismaClient();
+const bot = new WhatsAppBot(prisma);
 
-const bot = new WhatsAppBot(db);
+console.log('💾 Using PostgreSQL database with Prisma ORM');
 
 // Middleware
 app.use(cors());
@@ -37,6 +29,24 @@ app.use(express.urlencoded({ extended: true }));
 // Helper function to generate UUID
 function generateId() {
   return Math.random().toString(36).substr(2, 9);
+}
+
+// Helper function to convert BigInt to string for JSON serialization
+function convertBigInt(obj) {
+  if (typeof obj === 'bigint') {
+    return obj.toString();
+  }
+  if (Array.isArray(obj)) {
+    return obj.map(convertBigInt);
+  }
+  if (obj !== null && typeof obj === 'object') {
+    const result = {};
+    for (const key in obj) {
+      result[key] = convertBigInt(obj[key]);
+    }
+    return result;
+  }
+  return obj;
 }
 
 // ===== REST API ENDPOINTS (for web dashboard) =====
@@ -58,23 +68,57 @@ app.get('/', (req, res) => {
 });
 
 // Health check
-app.get('/api/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    message: 'WhatsApp CRM API running',
-    port: PORT,
-    database: 'JSON-based',
-    whatsappBot: 'active',
-    uptime: process.uptime()
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    // Test database connection
+    await prisma.workspace.count();
+    res.json({
+      status: 'ok',
+      message: 'WhatsApp CRM API running',
+      port: PORT,
+      database: 'PostgreSQL',
+      whatsappBot: 'active',
+      uptime: process.uptime()
+    });
+  } catch (error) {
+    res.status(503).json({
+      status: 'error',
+      message: 'Database connection failed',
+      error: error.message
+    });
+  }
 });
 
 // GET all invoices
 app.get('/api/invoices', async (req, res) => {
   try {
-    const invoices = await db.invoices.getAll();
+    // Use raw SQL to avoid BigInt serialization issues
+    const invoices = await prisma.$queryRaw`
+      SELECT
+        CAST(i.id AS TEXT) as id,
+        CAST(i.workspace_id AS TEXT) as workspace_id,
+        i.invoice_number,
+        CAST(i.customer_id AS TEXT) as customer_id,
+        i.issue_date,
+        i.due_date,
+        i.subtotal,
+        i.tax_rate,
+        i.tax_amount,
+        i.total,
+        i.status,
+        i.payment_status,
+        i.currency,
+        i.is_draft,
+        i.created_at,
+        i.updated_at,
+        i.deleted_at
+      FROM "Invoice" i
+      ORDER BY i.created_at DESC
+    `;
+
     res.json({ invoices });
   } catch (error) {
+    console.error('Error fetching invoices:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -82,7 +126,19 @@ app.get('/api/invoices', async (req, res) => {
 // GET invoices by phone number
 app.get('/api/invoices/phone/:phone', async (req, res) => {
   try {
-    const invoices = await db.invoices.getByPhone(req.params.phone);
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        customer: {
+          primary_phone: req.params.phone
+        }
+      },
+      include: {
+        customer: true
+      },
+      orderBy: {
+        created_at: 'desc'
+      }
+    });
     res.json({ invoices });
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -94,11 +150,23 @@ app.get('/api/invoices/:id', async (req, res) => {
   try {
     // Check if it's a phone number query
     if (req.params.id.includes('+') || req.params.id.includes('whatsapp')) {
-      const invoices = await db.invoices.getByPhone(req.params.id);
+      const invoices = await prisma.invoice.findMany({
+        where: {
+          customer: {
+            primary_phone: req.params.id
+          }
+        },
+        include: {
+          customer: true
+        }
+      });
       return res.json({ invoices });
     }
 
-    const invoice = await db.invoices.getById(req.params.id);
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: BigInt(req.params.id) },
+      include: { customer: true }
+    });
     if (!invoice) {
       return res.status(404).json({ error: 'Invoice not found' });
     }
@@ -111,23 +179,51 @@ app.get('/api/invoices/:id', async (req, res) => {
 // CREATE invoice
 app.post('/api/invoices', async (req, res) => {
   try {
-    const { vendor, amount, dueDate, project, description, status, phoneNumber } = req.body;
+    const { vendor, amount, dueDate, description, status, phoneNumber } = req.body;
 
     if (!vendor || !amount || !dueDate) {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    const invoice = {
-      phoneNumber: phoneNumber || 'manual',
-      vendor,
-      amount: parseFloat(amount),
-      dueDate,
-      project: project || null,
-      description: description || null,
-      status: status || 'pending'
-    };
+    // Find or create customer
+    let customer = await prisma.customer.findFirst({
+      where: {
+        primary_phone: phoneNumber || 'manual',
+        workspace_id: 1
+      }
+    });
 
-    const created = await db.invoices.create(invoice);
+    if (!customer) {
+      customer = await prisma.customer.create({
+        data: {
+          workspace_id: 1,
+          name: vendor,
+          primary_phone: phoneNumber || 'manual',
+          business_type: 'construction',
+          is_active: true
+        }
+      });
+    }
+
+    const created = await prisma.invoice.create({
+      data: {
+        workspace_id: 1,
+        invoice_number: `INV-${Date.now()}`,
+        customer_id: customer.id,
+        issue_date: new Date(),
+        due_date: new Date(dueDate),
+        subtotal: parseFloat(amount),
+        tax_rate: 20.0,
+        tax_amount: parseFloat(amount) * 0.20,
+        total: parseFloat(amount) * 1.20,
+        status: status || 'pending',
+        payment_status: status === 'paid' ? 'paid' : 'unpaid',
+        currency: 'MAD',
+        is_draft: false
+      },
+      include: { customer: true }
+    });
+
     res.status(201).json(created);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -137,19 +233,27 @@ app.post('/api/invoices', async (req, res) => {
 // UPDATE invoice status
 app.patch('/api/invoices/:id', async (req, res) => {
   try {
-    const { status } = req.body;
+    const { status, payment_status } = req.body;
 
-    if (!status) {
-      return res.status(400).json({ error: 'Status is required' });
+    if (!status && !payment_status) {
+      return res.status(400).json({ error: 'Status or payment_status is required' });
     }
 
-    const updated = await db.invoices.update(req.params.id, { status });
-    if (!updated) {
-      return res.status(404).json({ error: 'Invoice not found' });
-    }
+    const updated = await prisma.invoice.update({
+      where: { id: BigInt(req.params.id) },
+      data: {
+        status: status || undefined,
+        payment_status: payment_status || undefined,
+        updated_at: new Date()
+      },
+      include: { customer: true }
+    });
 
     res.json(updated);
   } catch (error) {
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -157,13 +261,15 @@ app.patch('/api/invoices/:id', async (req, res) => {
 // DELETE invoice
 app.delete('/api/invoices/:id', async (req, res) => {
   try {
-    const deleted = await db.invoices.delete(req.params.id);
-    if (!deleted) {
-      return res.status(404).json({ error: 'Invoice not found' });
-    }
+    await prisma.invoice.delete({
+      where: { id: BigInt(req.params.id) }
+    });
 
     res.json({ message: 'Invoice deleted' });
   } catch (error) {
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Invoice not found' });
+    }
     res.status(500).json({ error: error.message });
   }
 });
@@ -243,7 +349,7 @@ app.listen(PORT, () => {
   console.log(`✅ WhatsApp CRM running on port ${PORT}`);
   console.log(`📱 WhatsApp Webhook: /api/whatsapp/webhook`);
   console.log(`📡 Environment: ${process.env.NODE_ENV || 'development'}`);
-  console.log(`💾 Database: invoices.json`);
+  console.log(`💾 Database: PostgreSQL (Prisma ORM)`);
   console.log(`\n🚀 Ready to receive WhatsApp messages!`);
   console.log(`📋 API: http://localhost:${PORT}`);
 });

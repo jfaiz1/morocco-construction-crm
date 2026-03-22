@@ -1,6 +1,7 @@
 const axios = require('axios');
 const FormData = require('form-data');
 const https = require('https');
+const { PrismaClient } = require('@prisma/client');
 
 // Deepgram API for audio transcription
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
@@ -11,9 +12,10 @@ const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 
 class WhatsAppBot {
-  constructor(db) {
-    this.db = db;
+  constructor(prisma) {
+    this.prisma = prisma || new PrismaClient();
     this.conversations = {}; // Track conversation state per phone number
+    this.workspaceId = 1; // Default workspace ID (created during migration)
   }
 
   /**
@@ -83,17 +85,45 @@ class WhatsAppBot {
 
       const { vendor, amount, dueDate, description } = parseResult;
 
-      // Create invoice in database
-      const invoice = {
-        phoneNumber: fromNumber,
-        vendor,
-        amount: parseFloat(amount),
-        dueDate: new Date(dueDate).toISOString(),
-        description: description || caption,
-        status: 'pending'
-      };
+      // Find or create customer by phone number
+      let customer = await this.prisma.customer.findFirst({
+        where: {
+          primary_phone: fromNumber,
+          workspace_id: this.workspaceId
+        }
+      });
 
-      const created = await this.db.invoices.create(invoice);
+      if (!customer) {
+        customer = await this.prisma.customer.create({
+          data: {
+            workspace_id: this.workspaceId,
+            name: vendor || 'Unknown',
+            primary_phone: fromNumber,
+            business_type: 'construction',
+            is_active: true,
+            source: 'whatsapp'
+          }
+        });
+      }
+
+      // Create invoice in database
+      const created = await this.prisma.invoice.create({
+        data: {
+          workspace_id: this.workspaceId,
+          invoice_number: `INV-${Date.now()}`,
+          customer_id: customer.id,
+          issue_date: new Date(),
+          due_date: new Date(dueDate),
+          subtotal: parseFloat(amount),
+          tax_rate: 20.0,
+          tax_amount: parseFloat(amount) * 0.20,
+          total: parseFloat(amount) * 1.20,
+          status: 'pending',
+          payment_status: 'unpaid',
+          currency: 'MAD',
+          is_draft: false
+        }
+      });
 
       const conversation = this.conversations[fromNumber];
       conversation.invoices.push(created.id);
@@ -156,16 +186,16 @@ class WhatsAppBot {
 
       switch (intent.action) {
         case 'STATUS':
-          return this.getInvoiceStatus(fromNumber);
+          return await this.getInvoiceStatus(fromNumber);
 
         case 'REQUEST_PAYMENT':
           return await this.requestPayment(fromNumber, intent.invoiceId);
 
         case 'LIST_INVOICES':
-          return this.listInvoices(fromNumber);
+          return await this.listInvoices(fromNumber);
 
         case 'REMIND':
-          return this.sendReminders(fromNumber);
+          return await this.sendReminders(fromNumber);
 
         case 'HELP':
           return this.getHelp(fromNumber);
@@ -342,9 +372,25 @@ Respond only with JSON.`
   /**
    * Get invoice status for contractor
    */
-  getInvoiceStatus(fromNumber) {
-    const conversation = this.conversations[fromNumber];
-    const contractorInvoices = this.db.invoices.filter(i => i.phoneNumber === fromNumber);
+  async getInvoiceStatus(fromNumber) {
+    // Find customer by phone
+    const customer = await this.prisma.customer.findFirst({
+      where: {
+        primary_phone: fromNumber,
+        workspace_id: this.workspaceId
+      }
+    });
+
+    if (!customer) {
+      return this.translate(fromNumber, 'no_invoices');
+    }
+
+    const contractorInvoices = await this.prisma.invoice.findMany({
+      where: {
+        customer_id: customer.id,
+        workspace_id: this.workspaceId
+      }
+    });
 
     if (contractorInvoices.length === 0) {
       return this.translate(fromNumber, 'no_invoices');
@@ -354,14 +400,14 @@ Respond only with JSON.`
     let pending = 0, paid = 0, overdue = 0;
 
     contractorInvoices.forEach(inv => {
-      const daysOld = Math.floor((Date.now() - new Date(inv.dueDate)) / (1000 * 60 * 60 * 24));
-      const statusEmoji = inv.status === 'paid' ? '✅' : daysOld > 0 ? '⚠️' : '⏳';
+      const daysOld = Math.floor((Date.now() - new Date(inv.due_date)) / (1000 * 60 * 60 * 24));
+      const statusEmoji = inv.payment_status === 'paid' ? '✅' : daysOld > 0 ? '⚠️' : '⏳';
 
-      status += `${statusEmoji} ${inv.vendor}\n`;
-      status += `   ${inv.amount} MAD | ${this.formatDate(inv.dueDate)}\n`;
+      status += `${statusEmoji} ${inv.invoice_number}\n`;
+      status += `   ${inv.total} MAD | ${this.formatDate(inv.due_date)}\n`;
       status += `   🆔 \`${inv.id}\`\n\n`;
 
-      if (inv.status === 'paid') paid++;
+      if (inv.payment_status === 'paid') paid++;
       else if (daysOld > 0) overdue++;
       else pending++;
     });
@@ -374,7 +420,19 @@ Respond only with JSON.`
    * Request payment for an invoice
    */
   async requestPayment(fromNumber, invoiceId) {
-    const invoice = this.db.invoices.find(i => i.id === invoiceId && i.phoneNumber === fromNumber);
+    // Find invoice with customer verification
+    const invoice = await this.prisma.invoice.findFirst({
+      where: {
+        id: BigInt(invoiceId),
+        workspace_id: this.workspaceId,
+        customer: {
+          primary_phone: fromNumber
+        }
+      },
+      include: {
+        customer: true
+      }
+    });
 
     if (!invoice) {
       return this.translate(fromNumber, 'invoice_not_found');
@@ -384,7 +442,7 @@ Respond only with JSON.`
     const paymentMsg = `💳 *Demande de paiement*
 
 📋 Facture: \`${invoiceId}\`
-💰 Montant: *${invoice.amount} MAD*
+💰 Montant: *${invoice.total} MAD*
 
 Choisissez la méthode:
 1️⃣ Virement Instantané (20 sec)
@@ -399,15 +457,33 @@ Répondez avec votre choix!`;
   /**
    * List all invoices
    */
-  listInvoices(fromNumber) {
-    const contractorInvoices = this.db.invoices.filter(i => i.phoneNumber === fromNumber);
+  async listInvoices(fromNumber) {
+    // Find customer by phone
+    const customer = await this.prisma.customer.findFirst({
+      where: {
+        primary_phone: fromNumber,
+        workspace_id: this.workspaceId
+      }
+    });
+
+    if (!customer) {
+      return this.translate(fromNumber, 'no_invoices');
+    }
+
+    const contractorInvoices = await this.prisma.invoice.findMany({
+      where: {
+        customer_id: customer.id,
+        workspace_id: this.workspaceId
+      }
+    });
+
     if (contractorInvoices.length === 0) {
       return this.translate(fromNumber, 'no_invoices');
     }
 
     let list = '📋 *Toutes vos factures*\n\n';
     contractorInvoices.forEach(inv => {
-      list += `• ${inv.vendor} - ${inv.amount} MAD\n`;
+      list += `• ${inv.invoice_number} - ${inv.total} MAD\n`;
     });
     return list;
   }
@@ -415,12 +491,29 @@ Répondez avec votre choix!`;
   /**
    * Send payment reminders
    */
-  sendReminders(fromNumber) {
-    const contractorInvoices = this.db.invoices.filter(i =>
-      i.phoneNumber === fromNumber &&
-      i.status === 'pending' &&
-      new Date(i.dueDate) < new Date()
-    );
+  async sendReminders(fromNumber) {
+    // Find customer by phone
+    const customer = await this.prisma.customer.findFirst({
+      where: {
+        primary_phone: fromNumber,
+        workspace_id: this.workspaceId
+      }
+    });
+
+    if (!customer) {
+      return this.translate(fromNumber, 'no_reminders');
+    }
+
+    const contractorInvoices = await this.prisma.invoice.findMany({
+      where: {
+        customer_id: customer.id,
+        workspace_id: this.workspaceId,
+        payment_status: 'unpaid',
+        due_date: {
+          lt: new Date()
+        }
+      }
+    });
 
     if (contractorInvoices.length === 0) {
       return this.translate(fromNumber, 'no_reminders');
@@ -428,8 +521,8 @@ Répondez avec votre choix!`;
 
     let msg = '⏰ *Factures en retard*\n\n';
     contractorInvoices.forEach(inv => {
-      const daysOld = Math.floor((Date.now() - new Date(inv.dueDate)) / (1000 * 60 * 60 * 24));
-      msg += `⚠️ ${inv.vendor} - ${daysOld}j en retard\n`;
+      const daysOld = Math.floor((Date.now() - new Date(inv.due_date)) / (1000 * 60 * 60 * 24));
+      msg += `⚠️ ${inv.invoice_number} - ${daysOld}j en retard\n`;
     });
     return msg;
   }
@@ -583,7 +676,7 @@ Respond helpfully in the same language. Keep it short and WhatsApp-friendly.`
   }
 
   /**
-   * Note: Database is auto-saved to Firestore via db.invoices.create()
+   * Note: Database operations use Prisma ORM with PostgreSQL
    */
 }
 

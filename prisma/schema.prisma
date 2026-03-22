@@ -1,0 +1,546 @@
+// Prisma Schema for Morocco Construction WhatsApp CRM
+// PostgreSQL database with complete invoice/payment tracking
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================
+// 0. Workspace (Multi-tenancy)
+// ============================================
+
+model Workspace {
+  id            BigInt    @id @default(autoincrement())
+  name          String    @db.VarChar(255)
+  slug          String    @unique @db.VarChar(100)
+  description   String?   @db.Text
+  logo_url      String?   @db.VarChar(500)
+  is_active     Boolean   @default(true)
+
+  created_at    DateTime  @default(now())
+  updated_at    DateTime  @updatedAt
+  deleted_at    DateTime?
+
+  // Relations
+  users             User[]
+  customers         Customer[]
+  projects          Project[]
+  invoices          Invoice[]
+  payments          Payment[]
+  communications    Communication[]
+  automation_rules  AutomationRule[]
+  message_templates MessageTemplate[]
+
+  @@index([slug])
+}
+
+// ============================================
+// 1. Users (System Users)
+// ============================================
+
+model User {
+  id              BigInt    @id @default(autoincrement())
+  workspace_id    BigInt
+  email           String    @unique @db.VarChar(255)
+  phone_number    String?   @db.VarChar(20)
+  first_name      String?   @db.VarChar(100)
+  last_name       String?   @db.VarChar(100)
+  password_hash   String?   @db.VarChar(255)
+  is_active       Boolean   @default(true)
+  role            String    @default("user") @db.VarChar(50)  // admin|manager|user
+
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+  deleted_at      DateTime?
+
+  // Relations
+  workspace       Workspace @relation(fields: [workspace_id], references: [id])
+  assigned_customers    Customer[] @relation("AssignedUser")
+  created_customers     Customer[] @relation("CreatedByUser")
+  managed_projects      Project[] @relation("ProjectManager")
+  created_projects      Project[] @relation("CreatedByUser")
+  created_invoices      Invoice[] @relation("CreatedByUser")
+  created_payments      Payment[] @relation("CreatedByUser")
+  created_communications Communication[] @relation("CreatedByUser")
+  created_automation_rules AutomationRule[] @relation("CreatedByUser")
+  created_message_templates MessageTemplate[] @relation("CreatedByUser")
+
+  @@index([workspace_id])
+  @@index([email])
+}
+
+// ============================================
+// 2. Customers (Moroccan Contractors/Businesses)
+// ============================================
+
+model Customer {
+  id                BigInt    @id @default(autoincrement())
+  workspace_id      BigInt
+
+  // Basic Info
+  name              String    @db.VarChar(255)
+  business_name     String?   @db.VarChar(255)
+  business_type     String?   @db.VarChar(50)  // individual|sme|contractor|enterprise|supplier
+
+  // Registration Numbers (Morocco-specific)
+  cnss_number       String?   @db.VarChar(50)
+  patente_number    String?   @db.VarChar(50)
+  ice_number        String?   @db.VarChar(50)
+  tax_id            String?   @db.VarChar(50)
+
+  // Primary Contact
+  primary_phone     String    @db.VarChar(20)
+  primary_email     String?   @db.VarChar(255)
+
+  // Moroccan Location
+  region            String?   @db.VarChar(100)
+  city              String?   @db.VarChar(100)
+
+  // Business Preferences
+  banking_preference String?   @db.VarChar(50)  // cash|bank|mobilemoney|mixed
+  preferred_payment_terms Int?  @default(30)
+  credit_limit      Decimal   @default(0) @db.Decimal(15, 2)
+
+  // WhatsApp Setup
+  whatsapp_number   String?   @db.VarChar(20)
+  whatsapp_verified Boolean   @default(false)
+
+  // Relationship
+  assigned_user_id  BigInt?
+  tags              Json?     // Array of string tags
+  notes             String?   @db.Text
+
+  // Status
+  is_active         Boolean   @default(true)
+  is_archived       Boolean   @default(false)
+
+  // Audit
+  created_by        BigInt?
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+  deleted_at        DateTime?
+
+  // Relations
+  workspace         Workspace @relation(fields: [workspace_id], references: [id])
+  assigned_user     User?     @relation("AssignedUser", fields: [assigned_user_id], references: [id])
+  created_by_user   User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+
+  contacts          CustomerContact[]
+  projects          Project[]
+  invoices          Invoice[]
+  payments          Payment[]
+  communications    Communication[]
+
+  @@index([workspace_id])
+  @@index([primary_phone])
+  @@index([whatsapp_number])
+  @@index([assigned_user_id])
+}
+
+// ============================================
+// 3. Customer Contacts (Multiple emails, phones, addresses)
+// ============================================
+
+model CustomerContact {
+  id              BigInt    @id @default(autoincrement())
+  customer_id     BigInt
+
+  contact_type    String?   @db.VarChar(50)  // primary|billing|site|shipping
+  person_name     String?   @db.VarChar(255)
+  job_title       String?   @db.VarChar(100)
+
+  // Contact Methods as JSON
+  phone_numbers   Json?     // [{ type: "mobile"|"office", number: "", is_primary: true }]
+  emails          Json?     // [{ type: "work"|"personal", email: "", is_primary: true }]
+
+  // Address
+  address         Json?     // { street, city, postal_code, region, country }
+
+  // Status
+  is_primary      Boolean   @default(false)
+  is_active       Boolean   @default(true)
+
+  // Audit
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  // Relations
+  customer        Customer  @relation(fields: [customer_id], references: [id], onDelete: Cascade)
+
+  @@index([customer_id])
+}
+
+// ============================================
+// 4. Projects (Construction Sites)
+// ============================================
+
+model Project {
+  id                        BigInt    @id @default(autoincrement())
+  workspace_id              BigInt
+
+  // Identity
+  name                      String    @db.VarChar(255)
+  code                      String?   @unique @db.VarChar(50)
+  contractor_id             BigInt
+
+  // Location
+  site_name                 String?   @db.VarChar(255)
+  site_address              Json?     // { street, city, postal_code, region }
+
+  // Timeline
+  start_date                DateTime?
+  estimated_completion_date DateTime?
+  actual_completion_date    DateTime?
+
+  // Budget & Finance
+  contract_value            Decimal?  @db.Decimal(15, 2)
+  currency                  String    @default("MAD") @db.VarChar(3)
+
+  // Progress & Status
+  completion_percentage     Int       @default(0)
+  status                    String?   @db.VarChar(50)  // planned|ongoing|completed|on_hold|cancelled
+
+  // Team
+  project_manager_id        BigInt?
+  team_members              Json?     // [{ user_id, role }]
+
+  // Notes
+  description               String?   @db.Text
+  notes                     String?   @db.Text
+
+  // Audit
+  created_by                BigInt?
+  created_at                DateTime  @default(now())
+  updated_at                DateTime  @updatedAt
+  deleted_at                DateTime?
+
+  // Relations
+  workspace                 Workspace @relation(fields: [workspace_id], references: [id])
+  contractor                Customer  @relation(fields: [contractor_id], references: [id])
+  project_manager           User?     @relation("ProjectManager", fields: [project_manager_id], references: [id])
+  created_by_user           User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+
+  invoices                  Invoice[]
+
+  @@index([workspace_id])
+  @@index([contractor_id])
+  @@index([project_manager_id])
+}
+
+// ============================================
+// 5. Invoices (Core Financial Document)
+// ============================================
+
+model Invoice {
+  id                  BigInt    @id @default(autoincrement())
+  workspace_id        BigInt
+
+  // Numbering
+  invoice_number      String    @unique @db.VarChar(50)
+  invoice_year        Int?
+
+  // Parties
+  customer_id         BigInt
+  project_id          BigInt?
+
+  // Dates
+  issue_date          DateTime
+  due_date            DateTime
+
+  // Currency
+  currency            String    @default("MAD") @db.VarChar(3)
+  exchange_rate       Decimal   @default(1.0) @db.Decimal(10, 6)
+
+  // Totals
+  subtotal            Decimal   @default(0) @db.Decimal(15, 2)
+  tax_rate            Decimal   @default(20.0) @db.Decimal(5, 2)
+  tax_amount          Decimal   @default(0) @db.Decimal(15, 2)
+  total               Decimal   @default(0) @db.Decimal(15, 2)
+
+  // Discounts
+  discount_type       String?   @db.VarChar(50)  // percentage|fixed
+  discount_value      Decimal   @default(0) @db.Decimal(15, 2)
+
+  // Payment Info
+  payment_terms_days  Int       @default(30)
+  advance_required    Boolean   @default(false)
+  advance_percentage  Decimal?  @db.Decimal(5, 2)
+  advance_paid        Decimal   @default(0) @db.Decimal(15, 2)
+
+  // Status Tracking
+  status              String    @default("draft") @db.VarChar(50)  // draft|pending|sent|partial|paid|overdue|cancelled
+  payment_status      String?   @db.VarChar(50)  // unpaid|partial|paid
+
+  // Progress (for phased projects)
+  phase_name          String?   @db.VarChar(100)
+  completion_percentage Int     @default(0)
+
+  // Documents
+  pdf_url             String?   @db.VarChar(500)
+  pdf_generated_at    DateTime?
+
+  // Notes
+  internal_notes      String?   @db.Text
+  customer_notes      String?   @db.Text
+
+  // Soft Delete & Versioning
+  is_draft            Boolean   @default(true)
+  version_number      Int       @default(1)
+  amended_from        BigInt?
+  is_archived         Boolean   @default(false)
+
+  // Audit
+  created_by          BigInt?
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+  deleted_at          DateTime?
+
+  // Relations
+  workspace           Workspace @relation(fields: [workspace_id], references: [id])
+  customer            Customer  @relation(fields: [customer_id], references: [id])
+  project             Project?  @relation(fields: [project_id], references: [id])
+  created_by_user     User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+  amended_from_invoice Invoice? @relation("AmendedInvoices", fields: [amended_from], references: [id])
+  amending_invoices   Invoice[] @relation("AmendedInvoices")
+
+  items               InvoiceItem[]
+  payments            Payment[]
+
+  @@index([workspace_id])
+  @@index([customer_id])
+  @@index([invoice_number])
+  @@index([status])
+  @@index([due_date])
+  @@index([created_at])
+}
+
+// ============================================
+// 6. Invoice Line Items
+// ============================================
+
+model InvoiceItem {
+  id              BigInt    @id @default(autoincrement())
+  invoice_id      BigInt
+
+  // Description
+  description     String    @db.VarChar(500)
+
+  // Classification
+  category        String?   @db.VarChar(50)  // materials|labor|equipment|service|other
+
+  // Quantity & Unit
+  quantity        Decimal   @db.Decimal(10, 2)
+  unit            String?   @db.VarChar(50)  // m²|m³|kg|hour|day|lot|piece
+
+  // Pricing
+  unit_price      Decimal   @db.Decimal(15, 2)
+  line_total      Decimal   @db.Decimal(15, 2)
+
+  // Tax per item
+  tax_rate        Decimal   @default(0) @db.Decimal(5, 2)
+  tax_amount      Decimal   @default(0) @db.Decimal(15, 2)
+
+  // Notes
+  notes           String?   @db.Text
+
+  // Audit
+  created_at      DateTime  @default(now())
+  updated_at      DateTime  @updatedAt
+
+  // Relations
+  invoice         Invoice   @relation(fields: [invoice_id], references: [id], onDelete: Cascade)
+
+  @@index([invoice_id])
+}
+
+// ============================================
+// 7. Payments
+// ============================================
+
+model Payment {
+  id                  BigInt    @id @default(autoincrement())
+  workspace_id        BigInt
+
+  // Numbering
+  payment_number      String    @unique @db.VarChar(50)
+
+  // References
+  customer_id         BigInt
+  invoice_id          BigInt
+
+  // Amount & Currency
+  amount              Decimal   @db.Decimal(15, 2)
+  currency            String    @default("MAD") @db.VarChar(3)
+
+  // Payment Method (Morocco-specific)
+  payment_method      String    @db.VarChar(50)  // cash|bank_transfer|cheque|mobilemoney|card
+
+  // Method Details
+  payment_details     Json?     // Varies by method
+
+  // Timeline
+  payment_date        DateTime
+  received_date       DateTime?
+  reconciliation_date DateTime?
+
+  // Status
+  status              String?   @db.VarChar(50)  // pending|confirmed|reconciled|disputed
+
+  // Reference
+  customer_reference  String?   @db.VarChar(255)
+
+  // Documentation
+  receipt_url         String?   @db.VarChar(500)
+
+  // Notes
+  notes               String?   @db.Text
+
+  // Audit
+  created_by          BigInt?
+  created_at          DateTime  @default(now())
+  updated_at          DateTime  @updatedAt
+  deleted_at          DateTime?
+
+  // Relations
+  workspace           Workspace @relation(fields: [workspace_id], references: [id])
+  customer            Customer  @relation(fields: [customer_id], references: [id])
+  invoice             Invoice   @relation(fields: [invoice_id], references: [id])
+  created_by_user     User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+
+  @@index([workspace_id])
+  @@index([customer_id])
+  @@index([invoice_id])
+  @@index([payment_date])
+  @@index([status])
+}
+
+// ============================================
+// 8. Communication Log (WhatsApp Integration)
+// ============================================
+
+model Communication {
+  id                    BigInt    @id @default(autoincrement())
+  workspace_id          BigInt
+
+  // Entity Reference
+  entity_type           String?   @db.VarChar(50)  // customer|invoice|payment|project
+  entity_id             BigInt?
+  customer_id           BigInt
+
+  // Message Details
+  platform              String    @db.VarChar(50)  // whatsapp|email|sms|manual
+  direction             String    @db.VarChar(20)  // inbound|outbound
+
+  // Content
+  message_type          String?   @db.VarChar(100)  // invoice_sent|payment_reminder|status_update|greeting
+  subject               String?   @db.VarChar(255)
+  message_content       String?   @db.Text
+
+  // Attachments
+  attachment_url        String?   @db.VarChar(500)
+  attachment_type       String?   @db.VarChar(50)
+
+  // Platform-Specific
+  whatsapp_message_id   String?   @db.VarChar(255)
+  whatsapp_status       String?   @db.VarChar(50)  // sent|delivered|read|failed
+  email_message_id      String?   @db.VarChar(255)
+
+  // Status
+  status                String    @db.VarChar(50)  // sent|delivered|read|failed|pending
+  error_message         String?   @db.Text
+
+  // Audit
+  created_by            BigInt?
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+
+  // Relations
+  workspace             Workspace @relation(fields: [workspace_id], references: [id])
+  customer              Customer  @relation(fields: [customer_id], references: [id])
+  created_by_user       User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+
+  @@index([workspace_id])
+  @@index([customer_id])
+  @@index([entity_type, entity_id])
+  @@index([created_at])
+  @@index([platform])
+}
+
+// ============================================
+// 9. Automation Rules (WhatsApp Reminders, etc)
+// ============================================
+
+model AutomationRule {
+  id                    BigInt    @id @default(autoincrement())
+  workspace_id          BigInt
+
+  // Configuration
+  name                  String    @db.VarChar(255)
+  description           String?   @db.Text
+
+  // Trigger
+  trigger_type          String    @db.VarChar(50)  // invoice_created|payment_received|invoice_overdue|etc
+  trigger_config        Json?     // {days_before_due: 5, time: "09:00"}
+
+  // Action
+  action_type           String    @db.VarChar(50)  // send_whatsapp|send_email|send_sms
+  action_config         Json?     // {template_id, recipient_type}
+
+  // Message Template
+  template_id           BigInt?
+
+  // Execution Rules
+  is_active             Boolean   @default(true)
+  max_executions_per_day Int?
+
+  // Audit
+  created_by            BigInt?
+  created_at            DateTime  @default(now())
+  updated_at            DateTime  @updatedAt
+
+  // Relations
+  workspace             Workspace @relation(fields: [workspace_id], references: [id])
+  created_by_user       User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+
+  @@index([workspace_id])
+  @@index([trigger_type])
+}
+
+// ============================================
+// 10. Message Templates
+// ============================================
+
+model MessageTemplate {
+  id                BigInt    @id @default(autoincrement())
+  workspace_id      BigInt
+
+  // Configuration
+  name              String    @db.VarChar(255)
+  template_type     String    @db.VarChar(50)  // whatsapp|email|sms
+
+  // Content
+  subject           String?   @db.VarChar(255)
+  content           String    @db.Text
+
+  // Variables
+  variables         Json?     // [{name: "customer_name", type: "string"}]
+
+  // Status
+  is_active         Boolean   @default(true)
+
+  // Audit
+  created_by        BigInt?
+  created_at        DateTime  @default(now())
+  updated_at        DateTime  @updatedAt
+
+  // Relations
+  workspace         Workspace @relation(fields: [workspace_id], references: [id])
+  created_by_user   User?     @relation("CreatedByUser", fields: [created_by], references: [id])
+
+  @@index([workspace_id])
+}
