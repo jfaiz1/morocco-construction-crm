@@ -2,14 +2,21 @@ const admin = require('firebase-admin');
 const path = require('path');
 
 // Initialize Firebase with service account
-const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
-  path.join(__dirname, 'firebase-service-account.json');
-
 let db = null;
 
 function initializeFirestore() {
   try {
-    const serviceAccount = require(serviceAccountPath);
+    let serviceAccount;
+
+    // Try to get Firebase credentials from environment variable first (for deployed apps)
+    if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+      serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } else {
+      // Fall back to file (for local development)
+      const serviceAccountPath = process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+        path.join(__dirname, 'firebase-service-account.json');
+      serviceAccount = require(serviceAccountPath);
+    }
 
     admin.initializeApp({
       credential: admin.credential.cert(serviceAccount),
@@ -21,7 +28,7 @@ function initializeFirestore() {
     return db;
   } catch (error) {
     console.error('❌ Firestore init failed:', error.message);
-    console.log('💡 Create firebase-service-account.json in backend/ folder');
+    console.log('💡 Set FIREBASE_SERVICE_ACCOUNT_JSON environment variable or create firebase-service-account.json file');
     throw error;
   }
 }
