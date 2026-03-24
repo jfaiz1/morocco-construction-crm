@@ -1,44 +1,29 @@
-// database.js - Prisma Client Initialization
-// Handles PostgreSQL connection with proper error handling and connection pooling
-
+// database.js - Prisma Client Singleton
 const { PrismaClient } = require('@prisma/client');
 
+// Global BigInt JSON serialization
+BigInt.prototype.toJSON = function () {
+  return this.toString();
+};
+
 const prisma = new PrismaClient({
-  log: [
-    {
-      emit: 'event',
-      level: 'query',
-    },
-    {
-      emit: 'stdout',
-      level: 'error',
-    },
-    {
-      emit: 'stdout',
-      level: 'warn',
-    },
-  ],
+  log: process.env.NODE_ENV === 'development'
+    ? ['query', 'error', 'warn']
+    : ['error'],
 });
 
-// Log database queries in development
-if (process.env.NODE_ENV === 'development') {
-  prisma.$on('query', (e) => {
-    console.log('Query: ' + e.query);
-    console.log('Params: ' + JSON.stringify(e.params));
-    console.log('Duration: ' + e.duration + 'ms');
-  });
+// Handle graceful shutdown
+async function disconnect() {
+  await prisma.$disconnect();
 }
 
-// Handle graceful shutdown
 process.on('SIGINT', async () => {
-  console.log('\nClosing Prisma connection...');
-  await prisma.$disconnect();
+  await disconnect();
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  console.log('\nClosing Prisma connection...');
-  await prisma.$disconnect();
+  await disconnect();
   process.exit(0);
 });
 

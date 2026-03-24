@@ -1,37 +1,27 @@
 const axios = require('axios');
-const FormData = require('form-data');
-const https = require('https');
-const { PrismaClient } = require('@prisma/client');
 
-// Deepgram API for audio transcription
 const DEEPGRAM_API_KEY = process.env.DEEPGRAM_API_KEY;
 const DEEPGRAM_API_URL = 'https://api.deepgram.com/v1/listen';
-
-// Claude API
 const CLAUDE_API_KEY = process.env.CLAUDE_API_KEY;
 const CLAUDE_API_URL = 'https://api.anthropic.com/v1/messages';
 
 class WhatsAppBot {
   constructor(prisma) {
-    this.prisma = prisma || new PrismaClient();
-    this.conversations = {}; // Track conversation state per phone number
-    this.workspaceId = 1; // Default workspace ID (created during migration)
+    this.prisma = prisma;
+    this.conversations = {};
+    this.workspaceId = BigInt(1);
   }
 
-  /**
-   * Process incoming WhatsApp message
-   */
   async processMessage(fromNumber, mediaType, mediaUrl, messageText, mediaCaption) {
     console.log(`📨 Message from ${fromNumber} - Type: ${mediaType}`);
 
-    // Load or create conversation
     if (!this.conversations[fromNumber]) {
       this.conversations[fromNumber] = {
         phoneNumber: fromNumber,
         messages: [],
         invoices: [],
         lastAction: null,
-        language: 'fr' // Default to French, will detect
+        language: 'fr'
       };
     }
 
@@ -40,23 +30,22 @@ class WhatsAppBot {
 
     try {
       if (mediaType === 'image') {
-        // 📸 Handle invoice photo
         response = await this.handleInvoicePhoto(fromNumber, mediaUrl, mediaCaption);
       } else if (mediaType === 'audio') {
-        // 🎙️ Handle audio message
         response = await this.handleAudioMessage(fromNumber, mediaUrl);
       } else if (mediaType === 'text') {
-        // 💬 Handle text command
         response = await this.handleTextCommand(fromNumber, messageText);
       }
 
-      // Store message in conversation
       conversation.messages.push({
         timestamp: new Date().toISOString(),
         type: mediaType,
         content: messageText || mediaCaption || '[Media]',
         response: response
       });
+
+      // Log communication to database
+      await this.logCommunication(fromNumber, mediaType, messageText || mediaCaption, response);
 
       return response;
     } catch (error) {
@@ -65,18 +54,12 @@ class WhatsAppBot {
     }
   }
 
-  /**
-   * Handle invoice photo with Claude Vision
-   */
   async handleInvoicePhoto(fromNumber, mediaUrl, caption) {
     try {
       console.log(`🔍 Analyzing invoice photo from ${fromNumber}`);
 
-      // Download image
       const imageData = await this.downloadMedia(mediaUrl);
       const base64Image = imageData.toString('base64');
-
-      // Call Claude Vision to parse invoice
       const parseResult = await this.parseInvoiceWithClaude(base64Image);
 
       if (!parseResult.success) {
@@ -85,7 +68,7 @@ class WhatsAppBot {
 
       const { vendor, amount, dueDate, description } = parseResult;
 
-      // Find or create customer by phone number
+      // Find or create customer
       let customer = await this.prisma.customer.findFirst({
         where: {
           primary_phone: fromNumber,
@@ -99,70 +82,64 @@ class WhatsAppBot {
             workspace_id: this.workspaceId,
             name: vendor || 'Unknown',
             primary_phone: fromNumber,
-            business_type: 'construction',
-            is_active: true,
-            source: 'whatsapp'
+            whatsapp_number: fromNumber,
+            whatsapp_verified: true,
+            business_type: 'contractor',
+            is_active: true
           }
         });
       }
 
-      // Create invoice in database
+      const invoiceNumber = `INV-${new Date().getFullYear()}-${String(Date.now()).slice(-6)}`;
+      const parsedAmount = parseFloat(amount) || 0;
+      const taxAmount = parsedAmount * 0.20;
+
       const created = await this.prisma.invoice.create({
         data: {
           workspace_id: this.workspaceId,
-          invoice_number: `INV-${Date.now()}`,
+          invoice_number: invoiceNumber,
           customer_id: customer.id,
           issue_date: new Date(),
-          due_date: new Date(dueDate),
-          subtotal: parseFloat(amount),
+          due_date: dueDate ? new Date(dueDate) : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          subtotal: parsedAmount,
           tax_rate: 20.0,
-          tax_amount: parseFloat(amount) * 0.20,
-          total: parseFloat(amount) * 1.20,
+          tax_amount: taxAmount,
+          total: parsedAmount + taxAmount,
           status: 'pending',
           payment_status: 'unpaid',
           currency: 'MAD',
-          is_draft: false
+          is_draft: false,
+          customer_notes: description || caption || null
         }
       });
 
-      const conversation = this.conversations[fromNumber];
-      conversation.invoices.push(created.id);
+      this.conversations[fromNumber].invoices.push(created.id.toString());
 
-      // Send confirmation
-      const confirmMsg = `✅ *Facture créée*
+      return `✅ *Facture créée*
 
-📋 Client: *${vendor}*
-💰 Montant: *${amount} MAD*
-📅 Échéance: *${this.formatDate(dueDate)}*
-🆔 ID: \`${created.id}\`
+📋 Client: *${vendor || 'Non spécifié'}*
+💰 Montant: *${parsedAmount.toLocaleString('fr-FR')} MAD*
+📊 Total TTC: *${(parsedAmount + taxAmount).toLocaleString('fr-FR')} MAD*
+📅 Échéance: *${this.formatDate(created.due_date)}*
+🆔 Réf: \`${invoiceNumber}\`
 
-👉 Répondez "Paiement ${created.id}" pour demander le paiement`;
-
-      return confirmMsg;
+👉 Tapez "paiement ${invoiceNumber}" pour demander le paiement`;
     } catch (error) {
       console.error('Error handling invoice photo:', error);
       return this.translate(fromNumber, 'error_parsing_invoice');
     }
   }
 
-  /**
-   * Handle audio message - transcribe with Deepgram
-   */
   async handleAudioMessage(fromNumber, mediaUrl) {
     try {
       console.log(`🎙️ Transcribing audio from ${fromNumber}`);
-
-      // Download audio file
       const audioData = await this.downloadMedia(mediaUrl);
-
-      // Transcribe with Deepgram
       const transcript = await this.transcribeWithDeepgram(audioData);
 
       if (!transcript) {
         return this.translate(fromNumber, 'could_not_transcribe');
       }
 
-      // Process transcribed text as command
       return await this.handleTextCommand(fromNumber, transcript);
     } catch (error) {
       console.error('Error handling audio:', error);
@@ -170,38 +147,30 @@ class WhatsAppBot {
     }
   }
 
-  /**
-   * Handle text commands - natural language processing
-   */
   async handleTextCommand(fromNumber, text) {
     try {
       const conversation = this.conversations[fromNumber];
+      if (!conversation) return this.getHelp(fromNumber);
+
       const detectedLanguage = this.detectLanguage(text);
       conversation.language = detectedLanguage;
 
-      console.log(`💬 Text command from ${fromNumber}: "${text}"`);
+      console.log(`💬 Text from ${fromNumber}: "${text}"`);
 
-      // Use Claude to understand intent
       const intent = await this.detectIntent(text, detectedLanguage);
 
       switch (intent.action) {
         case 'STATUS':
           return await this.getInvoiceStatus(fromNumber);
-
         case 'REQUEST_PAYMENT':
           return await this.requestPayment(fromNumber, intent.invoiceId);
-
         case 'LIST_INVOICES':
           return await this.listInvoices(fromNumber);
-
         case 'REMIND':
           return await this.sendReminders(fromNumber);
-
         case 'HELP':
           return this.getHelp(fromNumber);
-
         default:
-          // Try to understand with Claude
           return await this.askClaude(fromNumber, text);
       }
     } catch (error) {
@@ -210,40 +179,30 @@ class WhatsAppBot {
     }
   }
 
-  /**
-   * Parse invoice photo with Claude Vision API
-   */
   async parseInvoiceWithClaude(base64Image) {
     try {
-      // Step 1: First, have Claude describe what it sees
+      // Step 1: Describe the invoice
       const descResponse = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-opus-4-1',
+        model: 'claude-sonnet-4-20250514',
         max_tokens: 500,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'image',
-                source: {
-                  type: 'base64',
-                  media_type: 'image/jpeg',
-                  data: base64Image
-                }
-              },
-              {
-                type: 'text',
-                text: `Read this invoice/receipt image and tell me:
-1. What company/vendor name do you see?
-2. What is the total amount (look for "Total", "Montant", "Total TTC", "Total NET")?
-3. What date do you see (look for "Date", "Échéance")?
-4. What is being invoiced for (brief description)?
-
+        messages: [{
+          role: 'user',
+          content: [
+            {
+              type: 'image',
+              source: { type: 'base64', media_type: 'image/jpeg', data: base64Image }
+            },
+            {
+              type: 'text',
+              text: `Read this invoice/receipt and tell me:
+1. Company/vendor name
+2. Total amount (look for "Total", "Montant", "Total TTC")
+3. Date (look for "Date", "Échéance")
+4. What is being invoiced (brief description)
 Answer in simple text, one item per line.`
-              }
-            ]
-          }
-        ]
+            }
+          ]
+        }]
       }, {
         headers: {
           'x-api-key': CLAUDE_API_KEY,
@@ -254,29 +213,20 @@ Answer in simple text, one item per line.`
       const descContent = descResponse.data.content.find(c => c.type === 'text');
       if (!descContent) return { success: false };
 
-      console.log('📄 Invoice description:', descContent.text);
-
-      // Step 2: Now extract structured JSON from the description
+      // Step 2: Extract structured JSON
       const extractResponse = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-opus-4-1',
+        model: 'claude-sonnet-4-20250514',
         max_tokens: 300,
-        messages: [
-          {
-            role: 'user',
-            content: `Based on this invoice information:
+        messages: [{
+          role: 'user',
+          content: `Based on this invoice information:
 ${descContent.text}
 
 Extract and return ONLY this JSON (no other text):
-{
-  "vendor": "company name",
-  "amount": "total number only",
-  "dueDate": "YYYY-MM-DD format",
-  "description": "brief description"
-}
+{"vendor":"company name","amount":"total number only","dueDate":"YYYY-MM-DD","description":"brief description"}
 
-Rules: Use null for any missing fields. If date is DD/MM/YYYY format, convert to YYYY-MM-DD.`
-          }
-        ]
+Rules: Use null for missing fields. Convert DD/MM/YYYY to YYYY-MM-DD. Amount should be numeric only.`
+        }]
       }, {
         headers: {
           'x-api-key': CLAUDE_API_KEY,
@@ -287,24 +237,17 @@ Rules: Use null for any missing fields. If date is DD/MM/YYYY format, convert to
       const extractContent = extractResponse.data.content.find(c => c.type === 'text');
       if (!extractContent) return { success: false };
 
-      // Extract JSON from response
       const jsonMatch = extractContent.text.match(/\{[\s\S]*\}/);
-      if (!jsonMatch) {
-        console.error('Could not find JSON in extraction response:', extractContent.text);
-        return { success: false };
-      }
+      if (!jsonMatch) return { success: false };
 
       const parsed = JSON.parse(jsonMatch[0]);
       return { success: true, ...parsed };
     } catch (error) {
-      console.error('Error parsing invoice with Claude:', error);
+      console.error('Error parsing invoice with Claude:', error.message);
       return { success: false };
     }
   }
 
-  /**
-   * Transcribe audio with Deepgram API
-   */
   async transcribeWithDeepgram(audioBuffer) {
     try {
       const response = await axios.post(DEEPGRAM_API_URL, audioBuffer, {
@@ -312,44 +255,27 @@ Rules: Use null for any missing fields. If date is DD/MM/YYYY format, convert to
           'Authorization': `Token ${DEEPGRAM_API_KEY}`,
           'Content-Type': 'audio/wav'
         },
-        params: {
-          model: 'nova-2',
-          language: 'auto',
-          smart_format: true
-        }
+        params: { model: 'nova-2', language: 'auto', smart_format: true }
       });
-
-      const transcript = response.data?.results?.channels?.[0]?.alternatives?.[0]?.transcript;
-      return transcript || null;
+      return response.data?.results?.channels?.[0]?.alternatives?.[0]?.transcript || null;
     } catch (error) {
-      console.error('Error transcribing with Deepgram:', error);
+      console.error('Deepgram error:', error.message);
       return null;
     }
   }
 
-  /**
-   * Detect intent from text with Claude
-   */
   async detectIntent(text, language) {
     try {
       const response = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-opus-4-1',
-        max_tokens: 256,
-        messages: [
-          {
-            role: 'user',
-            content: `Analyze this message and detect the user's intent. Respond in JSON format:
-{
-  "action": "STATUS|REQUEST_PAYMENT|LIST_INVOICES|REMIND|HELP|OTHER",
-  "invoiceId": "if requesting payment, the invoice ID",
-  "confidence": 0.0-1.0
-}
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: `Classify this message intent. Respond ONLY with JSON:
+{"action":"STATUS|REQUEST_PAYMENT|LIST_INVOICES|REMIND|HELP|OTHER","invoiceId":"invoice ref if mentioned","confidence":0.0}
 
-Message (${language}): "${text}"
-
-Respond only with JSON.`
-          }
-        ]
+Message (${language}): "${text}"`
+        }]
       }, {
         headers: {
           'x-api-key': CLAUDE_API_KEY,
@@ -358,326 +284,267 @@ Respond only with JSON.`
       });
 
       const textContent = response.data.content.find(c => c.type === 'text');
-      const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
-      if (jsonMatch) {
-        return JSON.parse(jsonMatch[0]);
-      }
-      return { action: 'OTHER', confidence: 0.5 };
+      const jsonMatch = textContent?.text.match(/\{[\s\S]*\}/);
+      return jsonMatch ? JSON.parse(jsonMatch[0]) : { action: 'OTHER', confidence: 0.5 };
     } catch (error) {
-      console.error('Error detecting intent:', error);
+      console.error('Intent detection error:', error.message);
       return { action: 'OTHER', confidence: 0.3 };
     }
   }
 
-  /**
-   * Get invoice status for contractor
-   */
   async getInvoiceStatus(fromNumber) {
-    // Find customer by phone
     const customer = await this.prisma.customer.findFirst({
-      where: {
-        primary_phone: fromNumber,
-        workspace_id: this.workspaceId
-      }
+      where: { primary_phone: fromNumber, workspace_id: this.workspaceId }
     });
 
-    if (!customer) {
-      return this.translate(fromNumber, 'no_invoices');
-    }
+    if (!customer) return this.translate(fromNumber, 'no_invoices');
 
-    const contractorInvoices = await this.prisma.invoice.findMany({
-      where: {
-        customer_id: customer.id,
-        workspace_id: this.workspaceId
-      }
+    const invoices = await this.prisma.invoice.findMany({
+      where: { customer_id: customer.id, deleted_at: null },
+      orderBy: { created_at: 'desc' },
+      take: 10
     });
 
-    if (contractorInvoices.length === 0) {
-      return this.translate(fromNumber, 'no_invoices');
-    }
+    if (invoices.length === 0) return this.translate(fromNumber, 'no_invoices');
 
     let status = '📊 *Vos factures*\n\n';
     let pending = 0, paid = 0, overdue = 0;
 
-    contractorInvoices.forEach(inv => {
-      const daysOld = Math.floor((Date.now() - new Date(inv.due_date)) / (1000 * 60 * 60 * 24));
-      const statusEmoji = inv.payment_status === 'paid' ? '✅' : daysOld > 0 ? '⚠️' : '⏳';
+    for (const inv of invoices) {
+      const daysOld = Math.floor((Date.now() - new Date(inv.due_date)) / (86400000));
+      const emoji = inv.payment_status === 'paid' ? '✅' : daysOld > 0 ? '⚠️' : '⏳';
 
-      status += `${statusEmoji} ${inv.invoice_number}\n`;
-      status += `   ${inv.total} MAD | ${this.formatDate(inv.due_date)}\n`;
-      status += `   🆔 \`${inv.id}\`\n\n`;
+      status += `${emoji} ${inv.invoice_number}\n`;
+      status += `   ${Number(inv.total).toLocaleString('fr-FR')} MAD | ${this.formatDate(inv.due_date)}\n\n`;
 
       if (inv.payment_status === 'paid') paid++;
       else if (daysOld > 0) overdue++;
       else pending++;
-    });
+    }
 
-    status += `\n📈 *Résumé*: ⏳ ${pending} | ✅ ${paid} | ⚠️ ${overdue}`;
+    status += `📈 *Résumé*: ⏳ ${pending} | ✅ ${paid} | ⚠️ ${overdue}`;
     return status;
   }
 
-  /**
-   * Request payment for an invoice
-   */
-  async requestPayment(fromNumber, invoiceId) {
-    // Find invoice with customer verification
-    const invoice = await this.prisma.invoice.findFirst({
-      where: {
-        id: BigInt(invoiceId),
-        workspace_id: this.workspaceId,
-        customer: {
-          primary_phone: fromNumber
-        }
-      },
-      include: {
-        customer: true
-      }
+  async requestPayment(fromNumber, invoiceRef) {
+    const customer = await this.prisma.customer.findFirst({
+      where: { primary_phone: fromNumber, workspace_id: this.workspaceId }
     });
 
-    if (!invoice) {
-      return this.translate(fromNumber, 'invoice_not_found');
+    if (!customer) return this.translate(fromNumber, 'invoice_not_found');
+
+    // Search by invoice number or ID
+    let invoice;
+    if (invoiceRef) {
+      invoice = await this.prisma.invoice.findFirst({
+        where: {
+          customer_id: customer.id,
+          OR: [
+            { invoice_number: { contains: invoiceRef } },
+            ...(invoiceRef.match(/^\d+$/) ? [{ id: BigInt(invoiceRef) }] : [])
+          ]
+        }
+      });
+    } else {
+      // Get most recent unpaid invoice
+      invoice = await this.prisma.invoice.findFirst({
+        where: { customer_id: customer.id, payment_status: 'unpaid' },
+        orderBy: { created_at: 'desc' }
+      });
     }
 
-    // TODO: Integrate actual payment methods
-    const paymentMsg = `💳 *Demande de paiement*
+    if (!invoice) return this.translate(fromNumber, 'invoice_not_found');
 
-📋 Facture: \`${invoiceId}\`
-💰 Montant: *${invoice.total} MAD*
+    return `💳 *Demande de paiement*
+
+📋 Facture: \`${invoice.invoice_number}\`
+💰 Montant: *${Number(invoice.total).toLocaleString('fr-FR')} MAD*
+📅 Échéance: *${this.formatDate(invoice.due_date)}*
 
 Choisissez la méthode:
-1️⃣ Virement Instantané (20 sec)
-2️⃣ Orange Money (mobile)
-3️⃣ Virement Bancaire (2-3 jours)
+1️⃣ ⚡ Virement Instantané (20 sec)
+2️⃣ 📱 Orange Money (mobile)
+3️⃣ 🏦 Virement Bancaire (2-3 jours)
 
-Répondez avec votre choix!`;
-
-    return paymentMsg;
+Répondez avec votre choix (1, 2 ou 3)`;
   }
 
-  /**
-   * List all invoices
-   */
   async listInvoices(fromNumber) {
-    // Find customer by phone
     const customer = await this.prisma.customer.findFirst({
-      where: {
-        primary_phone: fromNumber,
-        workspace_id: this.workspaceId
-      }
+      where: { primary_phone: fromNumber, workspace_id: this.workspaceId }
     });
 
-    if (!customer) {
-      return this.translate(fromNumber, 'no_invoices');
-    }
+    if (!customer) return this.translate(fromNumber, 'no_invoices');
 
-    const contractorInvoices = await this.prisma.invoice.findMany({
-      where: {
-        customer_id: customer.id,
-        workspace_id: this.workspaceId
-      }
+    const invoices = await this.prisma.invoice.findMany({
+      where: { customer_id: customer.id, deleted_at: null },
+      orderBy: { created_at: 'desc' },
+      take: 20
     });
 
-    if (contractorInvoices.length === 0) {
-      return this.translate(fromNumber, 'no_invoices');
-    }
+    if (invoices.length === 0) return this.translate(fromNumber, 'no_invoices');
 
     let list = '📋 *Toutes vos factures*\n\n';
-    contractorInvoices.forEach(inv => {
-      list += `• ${inv.invoice_number} - ${inv.total} MAD\n`;
-    });
+    let totalUnpaid = 0;
+
+    for (const inv of invoices) {
+      const emoji = inv.payment_status === 'paid' ? '✅' : '⏳';
+      list += `${emoji} ${inv.invoice_number} - ${Number(inv.total).toLocaleString('fr-FR')} MAD\n`;
+      if (inv.payment_status !== 'paid') totalUnpaid += Number(inv.total);
+    }
+
+    list += `\n💰 *Total impayé:* ${totalUnpaid.toLocaleString('fr-FR')} MAD`;
     return list;
   }
 
-  /**
-   * Send payment reminders
-   */
   async sendReminders(fromNumber) {
-    // Find customer by phone
     const customer = await this.prisma.customer.findFirst({
-      where: {
-        primary_phone: fromNumber,
-        workspace_id: this.workspaceId
-      }
+      where: { primary_phone: fromNumber, workspace_id: this.workspaceId }
     });
 
-    if (!customer) {
-      return this.translate(fromNumber, 'no_reminders');
-    }
+    if (!customer) return this.translate(fromNumber, 'no_reminders');
 
-    const contractorInvoices = await this.prisma.invoice.findMany({
+    const overdueInvoices = await this.prisma.invoice.findMany({
       where: {
         customer_id: customer.id,
-        workspace_id: this.workspaceId,
-        payment_status: 'unpaid',
-        due_date: {
-          lt: new Date()
-        }
-      }
+        payment_status: { not: 'paid' },
+        due_date: { lt: new Date() },
+        deleted_at: null
+      },
+      orderBy: { due_date: 'asc' }
     });
 
-    if (contractorInvoices.length === 0) {
-      return this.translate(fromNumber, 'no_reminders');
-    }
+    if (overdueInvoices.length === 0) return this.translate(fromNumber, 'no_reminders');
 
     let msg = '⏰ *Factures en retard*\n\n';
-    contractorInvoices.forEach(inv => {
-      const daysOld = Math.floor((Date.now() - new Date(inv.due_date)) / (1000 * 60 * 60 * 24));
-      msg += `⚠️ ${inv.invoice_number} - ${daysOld}j en retard\n`;
-    });
+    let totalOverdue = 0;
+
+    for (const inv of overdueInvoices) {
+      const daysOld = Math.floor((Date.now() - new Date(inv.due_date)) / 86400000);
+      msg += `⚠️ ${inv.invoice_number} - ${Number(inv.total).toLocaleString('fr-FR')} MAD (${daysOld}j en retard)\n`;
+      totalOverdue += Number(inv.total);
+    }
+
+    msg += `\n🔴 *Total en retard:* ${totalOverdue.toLocaleString('fr-FR')} MAD`;
     return msg;
   }
 
-  /**
-   * Get help message
-   */
   getHelp(fromNumber) {
-    return `🤖 *Aide - Commandes*
+    return `🤖 *Morocco Invoice CRM - Aide*
 
-📸 *Envoyer une photo* - L'IA parse la facture
-💬 *Texte* - Posez une question
-🎙️ *Audio* - Envoyez un message vocal
+📸 *Photo* → L'IA analyse la facture automatiquement
+💬 *Texte* → Posez n'importe quelle question
+🎙️ *Audio* → Envoyez un message vocal
 
-📊 Tapez "Statut" - Voir vos factures
-💳 Tapez "Paiement" - Demander paiement
-📋 Tapez "Liste" - Toutes les factures
-⏰ Tapez "Rappel" - Rappels de paiement
+*Commandes:*
+📊 "Statut" → Voir vos factures
+💳 "Paiement" → Demander un paiement
+📋 "Liste" → Toutes les factures
+⏰ "Rappel" → Factures en retard
+❓ "Aide" → Ce message
 
-🌍 Parlez en: Français, Arabe, Darija, Anglais ou Espagnol!`;
+🌍 Français | العربية | English | Español`;
   }
 
-  /**
-   * Ask Claude for general questions
-   */
   async askClaude(fromNumber, question) {
     try {
       const response = await axios.post(CLAUDE_API_URL, {
-        model: 'claude-opus-4-1',
-        max_tokens: 512,
-        messages: [
-          {
-            role: 'user',
-            content: `You are a helpful WhatsApp assistant for a Moroccan invoice CRM.
-The user asked (in their language): "${question}"
-
-Respond helpfully in the same language. Keep it short and WhatsApp-friendly.`
-          }
-        ]
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 400,
+        messages: [{
+          role: 'user',
+          content: `You are a WhatsApp assistant for a Moroccan construction invoice CRM.
+User asked: "${question}"
+Respond in the same language. Keep it short and WhatsApp-friendly (max 3 paragraphs).
+If they seem confused, suggest typing "Aide" for help.`
+        }]
       }, {
         headers: {
           'x-api-key': CLAUDE_API_KEY,
           'anthropic-version': '2023-06-01'
         }
       });
-
       return response.data.content[0].text;
     } catch (error) {
-      console.error('Error asking Claude:', error);
+      console.error('Claude error:', error.message);
       return '❌ Je n\'ai pas compris. Tapez "Aide" pour les commandes.';
     }
   }
 
-  /**
-   * Detect language from text
-   */
-  detectLanguage(text) {
-    // Simple language detection
-    const arabicPattern = /[\u0600-\u06FF]/;
-    const spanishPattern = /\b(el|la|de|que|y|el|para|con)\b/i;
-
-    if (arabicPattern.test(text)) return 'ar';
-    if (spanishPattern.test(text)) return 'es';
-    if (/\bthe\b|\bwhich\b|\bfor\b/i.test(text)) return 'en';
-    return 'fr'; // Default to French
-  }
-
-  /**
-   * Translate messages
-   */
-  translate(fromNumber, key) {
-    const conversation = this.conversations[fromNumber];
-    const lang = conversation?.language || 'fr';
-
-    const translations = {
-      'error_processing': {
-        fr: '❌ Erreur lors du traitement. Réessayez.',
-        ar: '❌ خطأ في المعالجة. حاول مرة أخرى.',
-        es: '❌ Error al procesar. Intenta de nuevo.'
-      },
-      'could_not_parse': {
-        fr: '❌ Je n\'ai pas pu lire la facture. Essayez une meilleure photo.',
-        ar: '❌ لم أتمكن من قراءة الفاتورة. حاول صورة أوضح.',
-        es: '❌ No pude leer la factura. Intenta una foto más clara.'
-      },
-      'no_invoices': {
-        fr: '📭 Vous n\'avez pas de factures.',
-        ar: '📭 ليس لديك فواتير.',
-        es: '📭 No tienes facturas.'
-      },
-      'invoice_not_found': {
-        fr: '❌ Facture introuvable.',
-        ar: '❌ الفاتورة غير موجودة.',
-        es: '❌ Factura no encontrada.'
-      },
-      'no_reminders': {
-        fr: '✅ Pas de rappels nécessaires!',
-        ar: '✅ لا توجد تنبيهات مطلوبة!',
-        es: '✅ ¡Sin recordatorios necesarios!'
-      },
-      'could_not_transcribe': {
-        fr: '❌ Je n\'ai pas pu comprendre l\'audio.',
-        ar: '❌ لم أستطع فهم الصوت.',
-        es: '❌ No pude entender el audio.'
-      },
-      'error_parsing_invoice': {
-        fr: '❌ Erreur lors de la lecture de la facture.',
-        ar: '❌ خطأ في قراءة الفاتورة.',
-        es: '❌ Error al leer la factura.'
-      },
-      'error_processing_audio': {
-        fr: '❌ Erreur lors du traitement de l\'audio.',
-        ar: '❌ خطأ في معالجة الصوت.',
-        es: '❌ Error al procesar el audio.'
-      }
-    };
-
-    return translations[key]?.[lang] || translations[key]?.['fr'] || 'Erreur';
-  }
-
-  /**
-   * Download media from URL
-   */
-  async downloadMedia(mediaUrl) {
+  async logCommunication(fromNumber, messageType, inboundContent, outboundContent) {
     try {
-      // Use axios with Twilio Basic Auth
-      const twilioAccountSid = process.env.TWILIO_ACCOUNT_SID;
-      const twilioAuthToken = process.env.TWILIO_AUTH_TOKEN;
-
-      const auth = Buffer.from(`${twilioAccountSid}:${twilioAuthToken}`).toString('base64');
-
-      const response = await axios.get(mediaUrl, {
-        headers: {
-          'Authorization': `Basic ${auth}`
-        },
-        responseType: 'arraybuffer'
+      const customer = await this.prisma.customer.findFirst({
+        where: { primary_phone: fromNumber, workspace_id: this.workspaceId }
       });
 
-      return Buffer.from(response.data);
+      if (!customer) return;
+
+      // Log inbound
+      await this.prisma.communication.create({
+        data: {
+          workspace_id: this.workspaceId,
+          customer_id: customer.id,
+          platform: 'whatsapp',
+          direction: 'inbound',
+          message_type: messageType,
+          message_content: inboundContent || '[Media]',
+          status: 'delivered'
+        }
+      });
+
+      // Log outbound
+      if (outboundContent) {
+        await this.prisma.communication.create({
+          data: {
+            workspace_id: this.workspaceId,
+            customer_id: customer.id,
+            platform: 'whatsapp',
+            direction: 'outbound',
+            message_type: 'bot_response',
+            message_content: outboundContent,
+            status: 'sent'
+          }
+        });
+      }
     } catch (error) {
-      console.error('Error downloading media from Twilio:', error.message);
-      throw error;
+      console.error('Communication log error:', error.message);
     }
   }
 
-  /**
-   * Format date
-   */
+  detectLanguage(text) {
+    if (/[\u0600-\u06FF]/.test(text)) return 'ar';
+    if (/\b(el|la|que|para|con)\b/i.test(text)) return 'es';
+    if (/\bthe\b|\bwhich\b|\bfor\b|\bhow\b/i.test(text)) return 'en';
+    return 'fr';
+  }
+
+  translate(fromNumber, key) {
+    const lang = this.conversations[fromNumber]?.language || 'fr';
+    const t = {
+      error_processing: { fr: '❌ Erreur. Réessayez.', ar: '❌ خطأ. حاول مرة أخرى.', en: '❌ Error. Try again.' },
+      could_not_parse: { fr: '❌ Impossible de lire la facture. Essayez une meilleure photo.', ar: '❌ لم أتمكن من قراءة الفاتورة.', en: '❌ Could not read the invoice.' },
+      no_invoices: { fr: '📭 Aucune facture trouvée.', ar: '📭 لا توجد فواتير.', en: '📭 No invoices found.' },
+      invoice_not_found: { fr: '❌ Facture introuvable.', ar: '❌ الفاتورة غير موجودة.', en: '❌ Invoice not found.' },
+      no_reminders: { fr: '✅ Pas de rappels nécessaires!', ar: '✅ لا تذكيرات مطلوبة!', en: '✅ No reminders needed!' },
+      could_not_transcribe: { fr: '❌ Audio non compris.', ar: '❌ لم أفهم الصوت.', en: '❌ Could not understand audio.' },
+      error_parsing_invoice: { fr: '❌ Erreur lecture facture.', ar: '❌ خطأ في قراءة الفاتورة.', en: '❌ Error reading invoice.' },
+      error_processing_audio: { fr: '❌ Erreur traitement audio.', ar: '❌ خطأ في معالجة الصوت.', en: '❌ Error processing audio.' }
+    };
+    return t[key]?.[lang] || t[key]?.fr || 'Erreur';
+  }
+
+  async downloadMedia(mediaUrl) {
+    const auth = Buffer.from(`${process.env.TWILIO_ACCOUNT_SID}:${process.env.TWILIO_AUTH_TOKEN}`).toString('base64');
+    const response = await axios.get(mediaUrl, {
+      headers: { 'Authorization': `Basic ${auth}` },
+      responseType: 'arraybuffer'
+    });
+    return Buffer.from(response.data);
+  }
+
   formatDate(dateString) {
     return new Date(dateString).toLocaleDateString('fr-FR');
   }
-
-  /**
-   * Note: Database operations use Prisma ORM with PostgreSQL
-   */
 }
 
 module.exports = WhatsAppBot;
