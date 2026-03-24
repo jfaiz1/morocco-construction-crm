@@ -28,6 +28,7 @@ export const api = {
   login: (email, password) => apiFetch('/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) }),
   register: (data) => apiFetch('/auth/register', { method: 'POST', body: JSON.stringify(data) }),
   me: () => apiFetch('/auth/me'),
+  updateProfile: (data) => apiFetch('/auth/profile', { method: 'PUT', body: JSON.stringify(data) }),
 
   // Dashboard
   stats: () => apiFetch('/dashboard/stats'),

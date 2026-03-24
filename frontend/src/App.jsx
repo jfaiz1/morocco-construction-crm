@@ -9,6 +9,7 @@ import CreateInvoice from './pages/CreateInvoice';
 import Customers from './pages/Customers';
 import CustomerDetail from './pages/CustomerDetail';
 import Payments from './pages/Payments';
+import Profile from './pages/Profile';
 
 function ProtectedRoute({ children }) {
   const { isAuthenticated } = useAuth();
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="customers" element={<Customers />} />
         <Route path="customers/:id" element={<CustomerDetail />} />
         <Route path="payments" element={<Payments />} />
+        <Route path="profile" element={<Profile />} />
       </Route>
     </Routes>
   );
